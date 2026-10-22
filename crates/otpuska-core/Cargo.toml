@@ -1,0 +1,21 @@
+[package]
+name = "otpuska-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vacation accounting: database, calculation engine, Excel import"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+calamine = "0.37.0"
+
+[dev-dependencies]
+tempfile = "3"

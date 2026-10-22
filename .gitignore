@@ -1,0 +1,11 @@
+/target
+/dist
+.DS_Store
+# Personal data must never be committed: databases, backups and the old workbooks.
+*.db
+*.db-wal
+*.db-shm
+*.xlsx
+*.xlsm
+*.before-restore
+/packaging/*.pyc

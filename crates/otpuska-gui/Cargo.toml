@@ -1,0 +1,31 @@
+[package]
+name = "otpuska-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Отпуска — desktop app (egui)"
+build = "build.rs"
+
+[[bin]]
+name = "otpuska"
+path = "src/main.rs"
+
+[dependencies]
+otpuska-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+egui-phosphor = "0.14"
+rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["png"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui_extras = "0.36"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
+tempfile = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
