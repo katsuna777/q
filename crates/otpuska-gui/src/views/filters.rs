@@ -184,7 +184,7 @@ pub fn leave_bar(ui: &mut Ui, id: &str, snap: &Snapshot, f: &mut LeaveFilter, sh
         if with_kind {
             ui.label(ui::text("Вид отпуска", 12.5, p.text3));
             egui::ComboBox::from_id_salt(ui.id().with((id, "kind")))
-                .width(140.0)
+                .width(230.0)
                 .selected_text(ui::text(f.kind.label(), 13.0, if f.kind == LeaveKind::Any { p.text2 } else { p.text }))
                 .show_ui(ui, |ui| {
                     for k in LeaveKind::ALL {

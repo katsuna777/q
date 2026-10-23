@@ -719,6 +719,8 @@ pub fn emp_picker(ui: &mut Ui, id: impl Hash + std::fmt::Debug, snap: &Snapshot,
                     .margin(Margin::symmetric(10, 7))
                     .font(FontId::proportional(13.0)),
             );
+            // The box is rebuilt every frame from this copy, so what is typed has to be written back.
+            ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
             if !r.has_focus() && ui.data(|d| d.get_temp::<bool>(id.with("focused")).is_none()) {
                 r.request_focus();
                 ui.data_mut(|d| d.insert_temp(id.with("focused"), true));
@@ -792,8 +794,10 @@ pub fn emp_picker(ui: &mut Ui, id: impl Hash + std::fmt::Debug, snap: &Snapshot,
             });
         });
     if !Popup::is_id_open(ui.ctx(), popup_id) {
+        // Closed (by a choice or by a click outside): the next opening starts with an empty search.
         ui.data_mut(|d| {
             d.remove::<bool>(id.with("focused"));
+            d.remove::<String>(id.with("filter"));
         });
     }
     changed

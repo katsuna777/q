@@ -8,6 +8,10 @@ description = "Vacation accounting: database, calculation engine, Excel import"
 [lib]
 doctest = false
 
+[features]
+# Files of the older schema, for the tests of the programs that use this crate.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

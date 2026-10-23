@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build Otpuska.app into dist/. Usage: packaging/macos/bundle.sh
 #   UNIVERSAL=1 packaging/macos/bundle.sh   # arm64 + x86_64 in one binary (needs both rust targets)
+#   DIST_DIR=dist/next packaging/macos/bundle.sh   # build elsewhere (default: dist), e.g. while dist/Otpuska.app is running
 set -eu
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
@@ -19,7 +20,8 @@ else
 fi
 
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-app="dist/Otpuska.app"
+dist="${DIST_DIR:-dist}"
+app="$dist/Otpuska.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/otpuska"

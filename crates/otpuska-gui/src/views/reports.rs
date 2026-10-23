@@ -62,7 +62,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     .vscroll(false)
                     .column(ui::exact(44.0))
                     .column(ui::rest(170.0))
-                    .column(ui::exact(210.0))
+                    .column(ui::exact(200.0))
+                    .column(ui::exact(150.0))
                     .column(ui::exact(120.0))
                     .column(ui::exact(60.0))
                     .column(ui::exact(170.0))
@@ -71,6 +72,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                         ui::head_cell(&mut h, "№", false);
                         ui::head_cell(&mut h, "ФИО", false);
                         ui::head_cell(&mut h, "Подразделение", false);
+                        ui::head_cell(&mut h, "Вид", false);
                         ui::head_cell(&mut h, "Статус", false);
                         ui::head_cell(&mut h, "Дней", true);
                         ui::head_cell(&mut h, "Даты отпуска", false);
@@ -83,6 +85,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                             ui::cell_text(&mut row, (n + 1).to_string(), p.text3);
                             ui::cell_strong(&mut row, &l.fio, p.text);
                             ui::cell_text(&mut row, &l.dept, p.text2);
+                            if l.leave.kind.is_paid() {
+                                ui::cell_text(&mut row, l.leave.kind.short(), p.text2);
+                            } else {
+                                ui::cell_pill(&mut row, l.leave.kind.short(), super::journal::kind_tone(l.leave.kind));
+                            }
                             match l.status {
                                 Some(s) => {
                                     ui::cell_pill(&mut row, s.label(), status_tone(s));
@@ -91,7 +98,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                                     ui::cell_text(&mut row, "", p.text2);
                                 }
                             }
-                            ui::cell_right(&mut row, engine::fmt_days(l.leave.total_days()), p.text);
+                            ui::cell_right(&mut row, engine::fmt_days(l.leave.length()), p.text);
                             let dates = match (l.leave.start, l.end) {
                                 (Some(s), Some(e)) => format!("{} – {}", date::fmt(s), date::fmt(e)),
                                 _ => String::new(),

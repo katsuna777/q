@@ -90,7 +90,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             st.rest = RestFilter::Any;
         }
         ui.horizontal(|ui| {
-            ui.label(ui::text("Остаток дней за рабочий год, считая от даты приема. Наведите курсор на ячейку — подробности.", 12.0, p.text3));
+            ui.label(ui::text("Остаток дней за рабочий год, считая от даты приема. Жёлтые даты — год продлён отпуском без оплаты или по уходу за ребёнком. Наведите курсор на ячейку — подробности.", 12.0, p.text3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| legend(ui, &p));
         });
         ui.add_space(6.0);
@@ -203,13 +203,14 @@ fn period_cell(row: &mut egui_extras::TableRow, p: &Pal, pr: Option<&PeriodRow>)
             Align2::CENTER_CENTER,
             format!("{}–{}", date::fmt_short(pr.start), date::fmt_short(pr.end)),
             FontId::new(9.5, egui::FontFamily::Proportional),
-            p.text3,
+            // A year that lasts longer than twelve months (unpaid / childcare leave) is marked.
+            if pr.shift > 0 { p.warn } else { p.text3 },
         );
     });
     if let Some(pr) = pr {
         resp.on_hover_ui(|ui| {
             let line = format!(
-                "Рабочий год {} – {}\nПоложено {} · отгулено {} · остаток {}{}\nКрайний срок {}{}",
+                "Рабочий год {} – {}\nПоложено {} · отгулено {} · остаток {}{}\nКрайний срок {}{}{}",
                 date::fmt(pr.start),
                 date::fmt(pr.end),
                 engine::fmt_days(pr.entitled),
@@ -228,6 +229,7 @@ fn period_cell(row: &mut egui_extras::TableRow, p: &Pal, pr: Option<&PeriodRow>)
                 } else {
                     String::new()
                 },
+                super::employee::shift_text(pr),
             );
             ui.label(line);
         });

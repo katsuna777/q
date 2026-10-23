@@ -5,7 +5,8 @@ use crate::ui;
 use crate::views;
 use anyhow::Result;
 use egui::{
-    vec2, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Sense, Stroke, Ui, UiBuilder,
+    vec2, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Popup, PopupCloseBehavior, Sense, Stroke, Ui,
+    UiBuilder,
 };
 use egui_phosphor::regular as icon;
 use otpuska_core::config::{self, Config};
@@ -13,6 +14,7 @@ use otpuska_core::date::{self, Date};
 use otpuska_core::db::Import;
 use otpuska_core::model::*;
 use otpuska_core::{Db, Snapshot};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -29,6 +31,8 @@ pub enum Route {
     Employee(Target),
     Periods,
     Journal,
+    Schedule,
+    Reminders,
     Reports,
     Settings,
 }
@@ -41,6 +45,23 @@ impl Route {
             other => other.clone(),
         }
     }
+}
+
+/// What the window should do next about databases; `launcher::Root` carries it out.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Switch {
+    /// Close this database and show the chooser.
+    Chooser,
+    /// Close this database and open another one.
+    Open(String),
+}
+
+/// What was chosen in the database list of the sidebar.
+enum SwitcherAct {
+    None,
+    Open(String),
+    New,
+    Chooser,
 }
 
 pub struct Toast {
@@ -67,8 +88,15 @@ pub struct App {
     pub today: Date,
     pub f: views::Forms,
     pub import_preview: Option<ImportPreview>,
+    /// Shown on the summary until dismissed: the file was upgraded to a newer schema when opened.
+    pub upgrade_notice: Option<String>,
+    /// Id of the open database in `config.databases` (none in tests with an in-memory one).
+    pub current_db: Option<String>,
+    /// What the other databases hold, read while the switcher in the sidebar is open.
+    db_menu: Option<HashMap<String, Result<otpuska_core::db::Peek, String>>>,
+    pub pending: Option<Switch>,
     armed: Option<(String, f64)>,
-    applied: Option<(bool, String, bool, i32)>,
+    applied: Option<ThemeKey>,
     logo: Option<egui::TextureHandle>,
     ctx: egui::Context,
     /// Tests read the printed reports here instead of opening a browser.
@@ -79,14 +107,17 @@ pub struct App {
 impl App {
     pub fn new(ctx: &egui::Context, db: Db, config: Config) -> Result<Self> {
         theme::install_fonts(ctx);
-        let logo = image::load_from_memory(include_bytes!("../assets/icon.png")).ok().map(|img| {
-            let rgba = img.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR)
-        });
+        let logo = load_logo(ctx);
         let today = date::today();
         let data = db.load()?;
         let snap = Rc::new(Snapshot::build(&data, today));
+        let upgrade_notice = db.upgrade().map(|u| match &u.backup {
+            Some(copy) => format!(
+                "База обновлена до новой версии программы — все сотрудники и отпуска на месте. Копия файла до обновления сохранена: {}",
+                ui::tildify(copy)
+            ),
+            None => "База обновлена до новой версии программы.".to_string(),
+        });
         let pal = theme::palette(true, "mono");
         let mut app = App {
             db,
@@ -99,6 +130,10 @@ impl App {
             today,
             f: views::Forms::default(),
             import_preview: None,
+            upgrade_notice,
+            current_db: None,
+            db_menu: None,
+            pending: None,
             armed: None,
             applied: None,
             logo,
@@ -221,6 +256,19 @@ impl App {
         self.reload();
     }
 
+    pub fn save_plan(&mut self, p: &Plan) -> bool {
+        let r = if p.id == 0 { self.db.insert_plan(p).map(|_| ()) } else { self.db.update_plan(p) };
+        let ok = self.report(r, "");
+        self.reload();
+        ok
+    }
+
+    pub fn delete_plan(&mut self, id: i64) {
+        let r = self.db.delete_plan(id);
+        self.report(r, "Запись удалена из графика");
+        self.reload();
+    }
+
     pub fn save_settings(&mut self, s: &Settings) {
         let r = self.db.save_settings(s);
         self.report(r, "");
@@ -295,7 +343,7 @@ impl App {
 
     pub fn apply_import(&mut self, import: Import) {
         // Keep the previous state next to the daily backups.
-        if self.db.is_empty().unwrap_or(true) == false {
+        if self.db.path() != std::path::Path::new(":memory:") && !self.db.is_empty().unwrap_or(true) {
             let dir = config::backups_dir(self.db.path());
             if std::fs::create_dir_all(&dir).is_ok() {
                 let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
@@ -391,27 +439,123 @@ impl App {
         }
     }
 
-    // ---- frame -------------------------------------------------------------------------
+    // ---- databases ---------------------------------------------------------------------
 
-    fn apply_theme(&mut self, ctx: &egui::Context) {
-        let dark = match self.config.ui.theme.as_deref() {
-            Some("light") => false,
-            Some("dark") => true,
-            _ => ctx.system_theme().map(|t| t == egui::Theme::Dark).unwrap_or(true),
-        };
-        let accent = self.config.ui.accent.clone().unwrap_or_else(|| "mono".into());
-        let reduce = self.config.ui.reduce_motion.unwrap_or(false);
-        let scale = (self.config.ui.scale.unwrap_or(1.0) * 100.0).round() as i32;
-        let key = (dark, accent.clone(), reduce, scale);
-        if self.applied.as_ref() != Some(&key) {
-            self.pal = theme::palette(dark, &accent);
-            theme::apply(ctx, &self.pal, reduce);
-            ctx.set_zoom_factor(scale as f32 / 100.0);
-            let pal = self.pal;
-            ctx.data_mut(|d| d.insert_temp(Id::NULL, pal));
-            self.applied = Some(key);
+    /// Name of the open database, as shown in the sidebar and the window title.
+    pub fn db_name(&self) -> Option<String> {
+        self.config.find_db(self.current_db.as_deref()?).map(|d| d.name.clone())
+    }
+
+    /// Why the open database must not be closed right now: something typed in would be lost.
+    fn unsaved_work(&self) -> Option<&'static str> {
+        if self.f.employee.dirty() {
+            return Some("В карточке сотрудника есть несохранённые изменения — сохраните или отмените их, потом меняйте базу");
+        }
+        if self.route == Route::Settings && self.f.settings.draft != self.snap.settings {
+            return Some("В «Настройках» есть несохранённые изменения расчёта — сохраните или отмените их, потом меняйте базу");
+        }
+        None
+    }
+
+    /// Close this database and show the chooser.
+    pub fn open_chooser(&mut self) {
+        if let Some(why) = self.unsaved_work() {
+            self.toast(false, why);
+            return;
+        }
+        self.pending = Some(Switch::Chooser);
+        self.ctx.request_repaint();
+    }
+
+    /// Close this database and open another one.
+    pub fn switch_database(&mut self, id: &str) {
+        if self.current_db.as_deref() == Some(id) {
+            return;
+        }
+        if let Some(why) = self.unsaved_work() {
+            self.toast(false, why);
+            return;
+        }
+        self.pending = Some(Switch::Open(id.to_string()));
+        self.ctx.request_repaint();
+    }
+
+    pub fn create_database(&mut self, name: &str) -> bool {
+        match self.config.create_database(name) {
+            Ok(id) => {
+                self.save_config();
+                let name = self.config.find_db(&id).map(|d| d.name.clone()).unwrap_or_default();
+                self.toast(true, format!("База «{name}» создана. Откройте её кнопкой «Открыть»"));
+                true
+            }
+            Err(e) => {
+                self.toast(false, format!("{e:#}"));
+                false
+            }
         }
     }
+
+    /// Adds a copy of a database file (a backup, a file from another computer) as a new database.
+    pub fn add_database_from_file(&mut self, name: &str) -> bool {
+        match crate::launcher::pick_and_add_database(&mut self.config, name) {
+            None => false,
+            Some(Ok(id)) => {
+                self.save_config();
+                let name = self.config.find_db(&id).map(|d| d.name.clone()).unwrap_or_default();
+                self.toast(true, format!("База «{name}» добавлена"));
+                true
+            }
+            Some(Err(e)) => {
+                self.toast(false, format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    pub fn rename_database(&mut self, id: &str, name: &str) -> bool {
+        match self.config.rename_database(id, name) {
+            Ok(()) => {
+                self.save_config();
+                self.toast(true, "Название изменено");
+                true
+            }
+            Err(e) => {
+                self.toast(false, format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    /// Deletes another database (never the open one): its files go to `deleted/` for a month.
+    pub fn delete_database(&mut self, id: &str) -> bool {
+        if self.current_db.as_deref() == Some(id) {
+            self.toast(false, "Открытую базу удалить нельзя — сначала откройте другую");
+            return false;
+        }
+        let name = self.config.find_db(id).map(|d| d.name.clone()).unwrap_or_default();
+        match self.config.remove_database(id) {
+            Ok(kept) => {
+                self.save_config();
+                let text = match kept {
+                    Some(dir) => format!("База «{name}» удалена. На случай ошибки её файлы ещё {} дней лежат здесь: {}", otpuska_core::databases::KEEP_DELETED_DAYS, ui::tildify(&dir)),
+                    None => format!("База «{name}» убрана из списка"),
+                };
+                self.toast(true, text);
+                true
+            }
+            Err(e) => {
+                self.toast(false, format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    pub fn set_ask_on_start(&mut self, ask: bool) {
+        self.config.ask_on_start = Some(ask);
+        self.save_config();
+    }
+
+    // ---- frame -------------------------------------------------------------------------
 
     /// The calculation date follows the clock; rebuild when midnight passes.
     fn check_day(&mut self) {
@@ -431,6 +575,8 @@ impl App {
             (Key::Num4, Route::Journal),
             (Key::Num5, Route::Reports),
             (Key::Num6, Route::Settings),
+            (Key::Num7, Route::Schedule),
+            (Key::Num8, Route::Reminders),
         ];
         for (key, route) in routes {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, key)) {
@@ -443,6 +589,39 @@ impl App {
     }
 }
 
+pub fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    image::load_from_memory(include_bytes!("../assets/icon.png")).ok().map(|img| {
+        let rgba = img.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR)
+    })
+}
+
+/// What the applied theme was built from: dark, accent, reduced motion, scale in percent.
+pub type ThemeKey = (bool, String, bool, i32);
+
+/// Applies theme, accent and scale from the settings when they differ from the last call.
+/// Shared by the working screen and the database chooser.
+pub fn sync_theme(ctx: &egui::Context, cfg: &config::Ui, pal: &mut Pal, applied: &mut Option<ThemeKey>) {
+    let dark = match cfg.theme.as_deref() {
+        Some("light") => false,
+        Some("dark") => true,
+        _ => ctx.system_theme().map(|t| t == egui::Theme::Dark).unwrap_or(true),
+    };
+    let accent = cfg.accent.clone().unwrap_or_else(|| "mono".into());
+    let reduce = cfg.reduce_motion.unwrap_or(false);
+    let scale = (cfg.scale.unwrap_or(1.0) * 100.0).round() as i32;
+    let key = (dark, accent.clone(), reduce, scale);
+    if applied.as_ref() != Some(&key) {
+        *pal = theme::palette(dark, &accent);
+        theme::apply(ctx, pal, reduce);
+        ctx.set_zoom_factor(scale as f32 / 100.0);
+        let pal = *pal;
+        ctx.data_mut(|d| d.insert_temp(Id::NULL, pal));
+        *applied = Some(key);
+    }
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
@@ -450,7 +629,7 @@ fn dirs_home() -> Option<PathBuf> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.apply_theme(&ctx);
+        sync_theme(&ctx, &self.config.ui, &mut self.pal, &mut self.applied);
         self.check_day();
         self.shortcuts(&ctx);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
@@ -472,6 +651,8 @@ impl eframe::App for App {
                 Route::Employee(target) => views::employee::show(self, ui, &target),
                 Route::Periods => views::periods::show(self, ui),
                 Route::Journal => views::journal::show(self, ui),
+                Route::Schedule => views::schedule::show(self, ui),
+                Route::Reminders => views::reminders::show(self, ui),
                 Route::Reports => views::reports::show(self, ui),
                 Route::Settings => views::settings::show(self, ui),
             }
@@ -560,6 +741,121 @@ impl App {
         }
     }
 
+    /// The open database: always visible so nobody works in the wrong organization. A click opens a
+    /// list of all the databases; choosing one switches to it right here.
+    fn db_chip(&mut self, ui: &mut Ui, name: &str) {
+        let p = self.pal;
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("База: {name}. Сменить")));
+        let popup_id = Id::new("db-switcher");
+        let open = Popup::is_id_open(ui.ctx(), popup_id);
+        let hot = resp.hovered() || open;
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(8),
+            if hot { p.hover } else { p.panel },
+            Stroke::new(1.0, if hot { p.border_strong } else { p.border }),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(rect.left_center() + vec2(11.0, 0.0), Align2::LEFT_CENTER, icon::DATABASE, egui::FontId::new(15.0, theme::icons()), p.text2);
+        let text_rect = egui::Rect::from_min_max(rect.left_top() + vec2(34.0, 0.0), rect.right_bottom() - vec2(30.0, 0.0));
+        ui.painter().with_clip_rect(text_rect).text(
+            rect.left_center() + vec2(34.0, 0.0),
+            Align2::LEFT_CENTER,
+            name,
+            egui::FontId::new(13.0, theme::medium()),
+            p.text,
+        );
+        ui.painter().text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, icon::CARET_UP_DOWN, egui::FontId::new(13.0, theme::icons()), p.text3);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let resp = if open { resp } else { resp.on_hover_text("Организация, с которой вы работаете. Нажмите, чтобы переключиться на другую") };
+
+        // What each database holds is read once, when the list opens (not on every frame).
+        if open && self.db_menu.is_none() {
+            let current = self.current_db.clone();
+            let info = self
+                .config
+                .databases
+                .iter()
+                .filter(|d| Some(&d.id) != current.as_ref())
+                .map(|d| (d.id.clone(), crate::launcher::peek_entry(&self.config, d)))
+                .collect();
+            self.db_menu = Some(info);
+        }
+        let entries = self.config.databases.clone();
+        let current = self.current_db.clone();
+        let info = self.db_menu.clone().unwrap_or_default();
+        let live = self.snap.emps.len() as i64;
+        let mut act = SwitcherAct::None;
+        Popup::from_response(&resp)
+            .id(popup_id)
+            .open_memory(resp.clicked().then_some(egui::SetOpenCommand::Toggle))
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .gap(4.0)
+            .width(rect.width().max(290.0))
+            .show(|ui| {
+                ui.set_min_width(rect.width().max(290.0) - 14.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui::section_title(ui, "Организации");
+                ui.add_space(4.0);
+                for d in &entries {
+                    let is_current = current.as_deref() == Some(d.id.as_str());
+                    let peeked = info.get(&d.id);
+                    let missing = peeked.is_some_and(|r| r.is_err());
+                    let (row, r) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if is_current || missing { Sense::hover() } else { Sense::click() });
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !is_current && !missing, format!("Переключиться на базу {}", d.name)));
+                    if is_current {
+                        ui.painter().rect_filled(row, CornerRadius::same(7), p.active);
+                    } else if r.hovered() && !missing {
+                        ui.painter().rect_filled(row, CornerRadius::same(7), p.hover);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let glyph = if is_current { icon::CHECK_CIRCLE } else { icon::DATABASE };
+                    ui.painter().text(row.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, glyph, egui::FontId::new(16.0, theme::icons()), if is_current { p.ok } else { p.text3 });
+                    let clip = ui.painter().with_clip_rect(egui::Rect::from_min_max(row.left_top() + vec2(34.0, 0.0), row.right_bottom() - vec2(6.0, 0.0)));
+                    clip.text(row.left_top() + vec2(34.0, 12.0), Align2::LEFT_CENTER, &d.name, egui::FontId::new(13.0, theme::medium()), if missing { p.text3 } else { p.text });
+                    let sub = match (is_current, peeked) {
+                        (true, _) => format!("открыта · {}", crate::launcher::plural(live, "сотрудник", "сотрудника", "сотрудников")),
+                        (false, Some(Ok(pk))) => crate::launcher::plural(pk.employees, "сотрудник", "сотрудника", "сотрудников"),
+                        (false, Some(Err(e))) => e.clone(),
+                        (false, None) => String::new(),
+                    };
+                    clip.text(row.left_top() + vec2(34.0, 27.0), Align2::LEFT_CENTER, sub, egui::FontId::proportional(11.5), if missing { p.danger } else { p.text3 });
+                    if r.clicked() {
+                        act = SwitcherAct::Open(d.id.clone());
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+                ui::divider(ui);
+                ui.add_space(4.0);
+                if ui::link(ui, Some(icon::PLUS), "Новая организация…").clicked() {
+                    act = SwitcherAct::New;
+                    ui.close();
+                }
+                ui.add_space(2.0);
+                if ui::link(ui, Some(icon::LIST), "Окно выбора базы").clicked() {
+                    act = SwitcherAct::Chooser;
+                    ui.close();
+                }
+                ui.add_space(2.0);
+            });
+        if !Popup::is_id_open(ui.ctx(), popup_id) {
+            self.db_menu = None;
+        }
+        match act {
+            SwitcherAct::None => {}
+            SwitcherAct::Open(id) => self.switch_database(&id),
+            SwitcherAct::New => {
+                self.f.settings.tab = views::settings::Tab::Bases;
+                self.go(Route::Settings);
+            }
+            SwitcherAct::Chooser => self.open_chooser(),
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut Ui) {
         let p = self.pal;
         // macOS: traffic lights sit over the sidebar; elsewhere the native title bar is above.
@@ -578,6 +874,10 @@ impl App {
                     }
                 });
             });
+            if let Some(name) = self.db_name() {
+                ui.add_space(10.0);
+                self.db_chip(ui, &name);
+            }
             ui.add_space(12.0);
             ui.spacing_mut().item_spacing.y = 2.0;
             let snap = self.snap.clone();
@@ -590,6 +890,16 @@ impl App {
             self.nav_item(ui, icon::TABLE, "Периоды", &format!("{cmd}3"), Route::Periods, None);
             let leaves = (!snap.leaves.is_empty()).then(|| (snap.leaves.len().to_string(), p.text3));
             self.nav_item(ui, icon::BOOK_OPEN_TEXT, "Журнал отпусков", &format!("{cmd}4"), Route::Journal, leaves);
+            self.nav_item(ui, icon::CALENDAR_DOTS, "График отпусков", &format!("{cmd}7"), Route::Schedule, (!snap.plans.is_empty()).then(|| (snap.plans.len().to_string(), p.text3)));
+            let (urgent, early) = (snap.reminders_urgent(), snap.reminders_early());
+            let bell = if urgent > 0 {
+                Some((urgent.to_string(), if snap.reminders.iter().any(|r| r.band == otpuska_core::schedule::Band::Missed) { p.danger } else { p.orange }))
+            } else if early > 0 {
+                Some((early.to_string(), p.warn))
+            } else {
+                None
+            };
+            self.nav_item(ui, icon::BELL, "Напоминания", &format!("{cmd}8"), Route::Reminders, bell);
             self.nav_item(ui, icon::CHART_BAR, "Отчёты", &format!("{cmd}5"), Route::Reports, None);
             self.nav_item(ui, icon::GEAR, "Настройки", &format!("{cmd}6"), Route::Settings, None);
 

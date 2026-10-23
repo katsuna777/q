@@ -4,6 +4,7 @@
 use crate::date;
 use crate::engine::{self, PeriodTone, Snapshot, State};
 use crate::model::Status;
+use crate::schedule::{Band, PlanStatus, ReminderKind};
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -159,7 +160,7 @@ fn leaves_table(snap: &Snapshot, rows: &[usize]) -> String {
     if rows.is_empty() {
         return nothing();
     }
-    let mut b = String::from("<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Статус</th><th class=\"n\">Дней</th><th>Даты отпуска</th><th>Примечание</th></tr></thead><tbody>");
+    let mut b = String::from("<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Вид</th><th>Статус</th><th class=\"n\">Дней</th><th>Даты отпуска</th><th>Примечание</th></tr></thead><tbody>");
     for (n, &i) in rows.iter().enumerate() {
         let l = &snap.leaves[i];
         let dates = match (l.leave.start, l.end) {
@@ -167,13 +168,14 @@ fn leaves_table(snap: &Snapshot, rows: &[usize]) -> String {
             _ => String::new(),
         };
         b += &format!(
-            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td class=\"{} nw\">{}</td><td class=\"n\">{}</td><td class=\"nw\">{}</td><td>{}</td></tr>",
+            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td class=\"nw\">{}</td><td class=\"{} nw\">{}</td><td class=\"n\">{}</td><td class=\"nw\">{}</td><td>{}</td></tr>",
             n + 1,
             esc(&l.fio),
             esc(&l.dept),
+            l.leave.kind.short(),
             leave_class(l.status),
             l.status.map(|s| s.label()).unwrap_or(""),
-            engine::fmt_days(l.leave.total_days()),
+            engine::fmt_days(l.leave.length()),
             dates,
             esc(&l.leave.note),
         );
@@ -265,16 +267,18 @@ pub fn journal(snap: &Snapshot, rows: &[usize], filters: &[String]) -> String {
     if rows.is_empty() {
         return document("Журнал отпусков", &(b + &nothing()));
     }
-    b += "<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Начало</th><th>Окончание</th><th class=\"n\">Основной, дн.</th><th class=\"n\">Доп., дн.</th><th>Статус</th><th class=\"n\">Остаток, дн.</th><th>Примечание</th></tr></thead><tbody>";
+    b += "<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Вид</th><th>Начало</th><th>Окончание</th><th class=\"n\">Дней</th><th class=\"n\">Основной, дн.</th><th class=\"n\">Доп., дн.</th><th>Статус</th><th class=\"n\">Остаток, дн.</th><th>Примечание</th></tr></thead><tbody>";
     for (n, &i) in rows.iter().enumerate() {
         let l = &snap.leaves[i];
         b += &format!(
-            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td class=\"nw\">{}</td><td class=\"nw\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"{} nw\">{}</td><td class=\"n\">{}</td><td>{}</td></tr>",
+            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td class=\"nw\">{}</td><td class=\"nw\">{}</td><td class=\"nw\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"{} nw\">{}</td><td class=\"n\">{}</td><td>{}</td></tr>",
             n + 1,
             esc(&l.fio),
             esc(&l.dept),
+            l.leave.kind.short(),
             date::fmt_opt(l.leave.start),
             date::fmt_opt(l.end),
+            if l.leave.length() > 0.0 { engine::fmt_days(l.leave.length()) } else { String::new() },
             if l.leave.base_days != 0.0 { engine::fmt_days(l.leave.base_days) } else { String::new() },
             if l.leave.extra_days != 0.0 { engine::fmt_days(l.leave.extra_days) } else { String::new() },
             leave_class(l.status),
@@ -285,6 +289,101 @@ pub fn journal(snap: &Snapshot, rows: &[usize], filters: &[String]) -> String {
     }
     b += "</tbody></table>";
     document("Журнал отпусков", &b)
+}
+
+fn plan_class(s: PlanStatus) -> &'static str {
+    match s {
+        PlanStatus::Ahead => "st-info",
+        PlanStatus::Booked => "st-soon",
+        PlanStatus::InLeave | PlanStatus::Done => "st-ok",
+        PlanStatus::Missed => "st-overdue",
+    }
+}
+
+/// `rows`: indexes into `snap.plans` in the order of the schedule screen. `year` 0 — every year.
+pub fn schedule(snap: &Snapshot, rows: &[usize], year: i32, filters: &[String]) -> String {
+    let title = if year == 0 { "График отпусков".to_string() } else { format!("График отпусков на {year} год") };
+    // The year is already in the title; keep the other filters in the header.
+    let other: Vec<String> = filters.iter().filter(|f| !f.starts_with("Год:")).cloned().collect();
+    let in_year = if year == 0 { snap.plans.len() } else { snap.plans.iter().filter(|p| p.plan.start.is_some_and(|s| chrono::Datelike::year(&s) == year)).count() };
+    let mut b = head(&title, snap, &other, rows.len(), in_year);
+    if rows.is_empty() {
+        return document(&title, &(b + &nothing()));
+    }
+    b += "<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Должность</th><th>Начало</th><th>Окончание</th><th class=\"n\">Дней</th><th>Статус</th><th>По журналу</th><th>Примечание</th></tr></thead><tbody>";
+    for (n, &i) in rows.iter().enumerate() {
+        let p = &snap.plans[i];
+        let position = p.emp_ix.map(|e| snap.emps[e].emp.position.as_str()).unwrap_or("");
+        let fact = p
+            .fact
+            .map(|li| &snap.leaves[li])
+            .map(|l| match (l.leave.start, l.end) {
+                (Some(s), Some(e)) => format!("{} – {}", date::fmt(s), date::fmt(e)),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        b += &format!(
+            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"nw\">{}</td><td class=\"nw\">{}</td><td class=\"n\">{}</td><td class=\"{} nw\">{}</td><td class=\"nw\">{}</td><td>{}</td></tr>",
+            n + 1,
+            esc(&p.fio),
+            esc(&p.dept),
+            esc(position),
+            date::fmt_opt(p.plan.start),
+            date::fmt_opt(p.end),
+            engine::fmt_days(p.plan.total_days()),
+            plan_class(p.status),
+            p.status.label(),
+            fact,
+            esc(&p.plan.note),
+        );
+    }
+    b += "</tbody></table>";
+    document(&title, &b)
+}
+
+/// `rows`: indexes into `snap.reminders` as the reminders screen shows them.
+pub fn reminders(snap: &Snapshot, rows: &[usize], filters: &[String]) -> String {
+    let p = &snap.params;
+    let mut b = head("Напоминания об отпусках", snap, filters, rows.len(), snap.reminders.len());
+    b += &format!(
+        "<p class=\"sub\">Начало отпуска: за {} дн. и за {} мес. · окончание отпуска по беременности и родам и по уходу за ребёнком: за {} дн. Работника нужно письменно уведомить о начале отпуска не позднее чем за {} дн. (ст. 123 ТК РФ).</p>",
+        p.remind_near_days,
+        p.remind_far_months,
+        p.remind_end_days,
+        crate::schedule::NOTICE_DAYS
+    );
+    if rows.is_empty() {
+        return document("Напоминания об отпусках", &(b + &nothing()));
+    }
+    b += "<table><thead><tr><th>№</th><th>ФИО</th><th>Подразделение</th><th>Что</th><th>Дата</th><th>Когда</th><th>Отпуск</th><th class=\"n\">Дней</th><th>Уведомить до</th></tr></thead><tbody>";
+    for (n, &i) in rows.iter().enumerate() {
+        let r = &snap.reminders[i];
+        let e = &snap.emps[r.emp_ix];
+        let class = match (r.band, r.kind) {
+            (Band::Missed, _) => "st-overdue",
+            (Band::Near, _) => "st-burning",
+            (Band::Far, _) => "st-soon",
+        };
+        let period = match (r.kind, r.end) {
+            (ReminderKind::End(_), _) => format!("до {}, выход {}", date::fmt(r.date), date::fmt_opt(r.back_to_work())),
+            (_, Some(end)) => format!("{} – {}", date::fmt(r.date), date::fmt(end)),
+            _ => date::fmt(r.date),
+        };
+        b += &format!(
+            "<tr><td class=\"n muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"nw\">{}</td><td class=\"{class} nw\">{}</td><td class=\"nw\">{}</td><td class=\"n\">{}</td><td class=\"nw\">{}</td></tr>",
+            n + 1,
+            esc(&e.emp.fio),
+            esc(&e.dept),
+            r.kind_label(),
+            date::fmt(r.date),
+            r.when(),
+            period,
+            engine::fmt_days(r.leave_days),
+            date::fmt_opt(r.notify_by()),
+        );
+    }
+    b += "</tbody></table>";
+    document("Напоминания об отпусках", &b)
 }
 
 /// `rows`: indexes into `snap.emps` in the order of the directory screen.
@@ -338,6 +437,7 @@ mod tests {
             departments: vec![Department { id: 1, name: "Цех <1> & Ко".into() }, Department { id: 2, name: "Офис".into() }],
             employees: vec![emp(1, "Иванов \"Иван\"", 1), emp(2, "Петров", 2), emp(3, "Сидоров", 2)],
             leaves: vec![Leave { id: 1, employee_id: 1, start: Date::from_ymd_opt(2026, 10, 20), base_days: 14.0, ..Default::default() }],
+            ..Default::default()
         };
         Snapshot::build(&data, date::today())
     }

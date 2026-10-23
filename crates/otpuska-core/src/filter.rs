@@ -3,7 +3,8 @@
 
 use crate::date::{self, Date};
 use crate::engine::{self, LeaveRow, LeaveStatus, Snapshot, State};
-use crate::model::Status;
+use crate::model::{LeaveType, Params, Status};
+use crate::schedule::{Band, PlanStatus, ReminderKind};
 use chrono::Datelike;
 
 // ---- period -----------------------------------------------------------------------------
@@ -352,18 +353,37 @@ impl LeaveShow {
 pub enum LeaveKind {
     #[default]
     Any,
+    /// Annual leave that has base days.
     Base,
+    /// Annual leave that has additional days.
     Extra,
+    Unpaid,
+    Maternity,
+    Childcare,
 }
 
 impl LeaveKind {
-    pub const ALL: [LeaveKind; 3] = [LeaveKind::Any, LeaveKind::Base, LeaveKind::Extra];
+    pub const ALL: [LeaveKind; 6] = [LeaveKind::Any, LeaveKind::Base, LeaveKind::Extra, LeaveKind::Unpaid, LeaveKind::Maternity, LeaveKind::Childcare];
 
     pub fn label(self) -> &'static str {
         match self {
             LeaveKind::Any => "Любой",
             LeaveKind::Base => "Основной",
             LeaveKind::Extra => "Дополнительный",
+            LeaveKind::Unpaid => LeaveType::Unpaid.label(),
+            LeaveKind::Maternity => LeaveType::Maternity.label(),
+            LeaveKind::Childcare => LeaveType::Childcare.label(),
+        }
+    }
+
+    fn matches(self, l: &LeaveRow) -> bool {
+        match self {
+            LeaveKind::Any => true,
+            LeaveKind::Base => l.leave.kind.is_paid() && l.leave.base_days > 0.0,
+            LeaveKind::Extra => l.leave.kind.is_paid() && l.leave.extra_days > 0.0,
+            LeaveKind::Unpaid => l.leave.kind == LeaveType::Unpaid,
+            LeaveKind::Maternity => l.leave.kind == LeaveType::Maternity,
+            LeaveKind::Childcare => l.leave.kind == LeaveType::Childcare,
         }
     }
 }
@@ -418,13 +438,167 @@ impl Snapshot {
                 let l = &self.leaves[i];
                 f.show.matches(l.status)
                     && (f.dept.is_none() || l.emp_ix.is_some_and(|e| self.emps[e].emp.department_id == f.dept))
-                    && match f.kind {
-                        LeaveKind::Any => true,
-                        LeaveKind::Base => l.leave.base_days > 0.0,
-                        LeaveKind::Extra => l.leave.extra_days > 0.0,
-                    }
+                    && f.kind.matches(l)
                     && in_range(l, bounds)
                     && (contains_ci(&l.fio, &needle) || contains_ci(&l.dept, &needle) || contains_ci(&l.leave.note, &needle))
+            })
+            .collect()
+    }
+}
+
+// ---- vacation schedule -----------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanShow {
+    #[default]
+    All,
+    Only(PlanStatus),
+}
+
+impl PlanShow {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanShow::All => "Все",
+            PlanShow::Only(s) => s.label(),
+        }
+    }
+
+    fn matches(self, s: PlanStatus) -> bool {
+        match self {
+            PlanShow::All => true,
+            PlanShow::Only(x) => x == s,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanFilter {
+    pub search: String,
+    pub dept: Option<i64>,
+    /// Calendar year of the start of the leave; 0 — every year.
+    pub year: i32,
+    pub show: PlanShow,
+}
+
+impl PlanFilter {
+    pub fn is_active(&self) -> bool {
+        !self.search.trim().is_empty() || self.dept.is_some() || self.show != PlanShow::All
+    }
+
+    pub fn describe(&self, snap: &Snapshot) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.year != 0 {
+            out.push(format!("Год: {}", self.year));
+        }
+        if let Some(id) = self.dept {
+            out.push(format!("Подразделение: {}", snap.dept_name(Some(id))));
+        }
+        if self.show != PlanShow::All {
+            out.push(format!("Статус: {}", self.show.label()));
+        }
+        if !self.search.trim().is_empty() {
+            out.push(format!("Поиск: «{}»", self.search.trim()));
+        }
+        out
+    }
+}
+
+impl Snapshot {
+    /// Indexes into `plans` in the order they were entered. `with_status = false` ignores the
+    /// status selection (the tiles above the table count every status).
+    pub fn plan_rows(&self, f: &PlanFilter, with_status: bool) -> Vec<usize> {
+        let needle = f.search.trim().to_lowercase();
+        (0..self.plans.len())
+            .filter(|&i| {
+                let p = &self.plans[i];
+                (f.year == 0 || p.plan.start.is_some_and(|s| s.year() == f.year))
+                    && (f.dept.is_none() || p.emp_ix.is_some_and(|e| self.emps[e].emp.department_id == f.dept))
+                    && (!with_status || f.show.matches(p.status))
+                    && (contains_ci(&p.fio, &needle) || contains_ci(&p.dept, &needle) || contains_ci(&p.plan.note, &needle))
+            })
+            .collect()
+    }
+}
+
+// ---- reminders ----------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReminderShow {
+    #[default]
+    All,
+    /// A leave starts within the near stage (14 days by default).
+    Near,
+    /// A leave starts within the early stage (a month by default).
+    Far,
+    /// A maternity or childcare leave ends soon.
+    End,
+    /// A planned leave is not in the journal.
+    Missed,
+}
+
+impl ReminderShow {
+    pub const ALL: [ReminderShow; 5] = [ReminderShow::All, ReminderShow::Near, ReminderShow::Far, ReminderShow::End, ReminderShow::Missed];
+
+    /// The labels follow the stages set in the settings.
+    pub fn label(self, p: &Params) -> String {
+        match self {
+            ReminderShow::All => "Все".to_string(),
+            ReminderShow::Near => format!("За {} дн.", p.remind_near_days),
+            ReminderShow::Far => format!("За {} мес.", p.remind_far_months),
+            ReminderShow::End => "Конец отпуска".to_string(),
+            ReminderShow::Missed => "Не оформлены".to_string(),
+        }
+    }
+
+    fn matches(self, r: &crate::schedule::Reminder) -> bool {
+        match self {
+            ReminderShow::All => true,
+            ReminderShow::Near => r.band == Band::Near && matches!(r.kind, ReminderKind::Start | ReminderKind::PlanStart),
+            ReminderShow::Far => r.band == Band::Far,
+            ReminderShow::End => matches!(r.kind, ReminderKind::End(_)),
+            ReminderShow::Missed => r.kind == ReminderKind::PlanMissed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReminderFilter {
+    pub search: String,
+    pub dept: Option<i64>,
+    pub show: ReminderShow,
+}
+
+impl ReminderFilter {
+    pub fn is_active(&self) -> bool {
+        !self.search.trim().is_empty() || self.dept.is_some() || self.show != ReminderShow::All
+    }
+
+    pub fn describe(&self, snap: &Snapshot) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.show != ReminderShow::All {
+            out.push(format!("Показаны: {}", self.show.label(&snap.params).to_lowercase()));
+        }
+        if let Some(id) = self.dept {
+            out.push(format!("Подразделение: {}", snap.dept_name(Some(id))));
+        }
+        if !self.search.trim().is_empty() {
+            out.push(format!("Поиск: «{}»", self.search.trim()));
+        }
+        out
+    }
+}
+
+impl Snapshot {
+    /// Indexes into `reminders` (already most urgent first).
+    pub fn reminder_rows(&self, f: &ReminderFilter) -> Vec<usize> {
+        let needle = f.search.trim().to_lowercase();
+        (0..self.reminders.len())
+            .filter(|&i| {
+                let r = &self.reminders[i];
+                let e = &self.emps[r.emp_ix];
+                f.show.matches(r)
+                    && (f.dept.is_none() || e.emp.department_id == f.dept)
+                    && (contains_ci(&e.emp.fio, &needle) || contains_ci(&e.dept, &needle) || contains_ci(&e.emp.position, &needle))
             })
             .collect()
     }
@@ -457,6 +631,7 @@ mod tests {
                 leave(3, 3, Some(d(2027, 2, 1)), 14.0),
                 leave(4, 1, None, 14.0),
             ],
+            ..Default::default()
         };
         Snapshot::build(&data, date::today())
     }

@@ -54,6 +54,17 @@ fn compare(a: &LeaveRow, b: &LeaveRow, col: Col) -> Ordering {
     }
 }
 
+/// Color of the pill with the kind of a leave that is not the annual one.
+pub fn kind_tone(k: otpuska_core::model::LeaveType) -> Tone {
+    use otpuska_core::model::LeaveType;
+    match k {
+        LeaveType::Paid => Tone::Neutral,
+        LeaveType::Unpaid => Tone::Warn,
+        LeaveType::Maternity => Tone::Violet,
+        LeaveType::Childcare => Tone::Salmon,
+    }
+}
+
 pub fn status_tone(s: LeaveStatus) -> Tone {
     match s {
         LeaveStatus::InLeave => Tone::Ok,
@@ -141,27 +152,32 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             return;
         }
 
-        let avail = ui.available_width() - 4.0;
-        let show = fit(avail, 56.0 + 220.0 + 100.0 + 120.0 + 70.0 + 76.0, &[(1, 100.0), (2, 80.0), (3, 210.0), (4, 100.0), (5, 190.0)]);
+        // Room for the scrollbar of the table as well.
+        let avail = ui.available_width() - 24.0;
+        // Optional columns: end, base days, extra days, department, remainder, note.
+        let show = fit(avail, 56.0 + 220.0 + 150.0 + 100.0 + 70.0 + 120.0 + 76.0, &[(1, 100.0), (3, 80.0), (3, 80.0), (4, 210.0), (2, 100.0), (5, 190.0)]);
         let editing = app.f.journal.draft.id;
         ui::flush_card(ui, |ui| {
             let mut t = ui::table(ui, "journal").column(ui::exact(56.0)).column(ui::rest(220.0));
             if show[3] {
                 t = t.column(ui::exact(210.0));
             }
-            t = t.column(ui::exact(100.0));
+            t = t.column(ui::exact(150.0)).column(ui::exact(100.0));
             if show[0] {
                 t = t.column(ui::exact(100.0));
             }
-            t = t.column(ui::exact(80.0));
+            t = t.column(ui::exact(70.0));
             if show[1] {
                 t = t.column(ui::exact(80.0));
             }
-            t = t.column(ui::exact(120.0));
             if show[2] {
+                t = t.column(ui::exact(80.0));
+            }
+            t = t.column(ui::exact(120.0));
+            if show[4] {
                 t = t.column(ui::exact(100.0));
             }
-            if show[4] {
+            if show[5] {
                 t = t.column(ui::exact(190.0));
             }
             t.column(ui::exact(76.0))
@@ -175,23 +191,27 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     if show[3] {
                         ui::head_cell(&mut h, "Подразделение", false);
                     }
+                    ui::head_cell(&mut h, "Вид", false);
                     if ui::head_sort(&mut h, "Начало", false, sort.arrow(Col::Start)) {
                         sort_click = Some(Col::Start);
                     }
                     if show[0] {
                         ui::head_cell(&mut h, "Окончание", false);
                     }
-                    ui::head_cell(&mut h, "Основной", true);
+                    ui::head_tip(&mut h, "Дней", true, "Календарные дни отпуска");
                     if show[1] {
-                        ui::head_cell(&mut h, "Доп.", true);
+                        ui::head_tip(&mut h, "Осн.", true, "Основной отпуск, дней (только ежегодный)");
+                    }
+                    if show[2] {
+                        ui::head_tip(&mut h, "Доп.", true, "Дополнительный отпуск за вредность, дней (только ежегодный)");
                     }
                     if ui::head_sort(&mut h, "Статус", false, sort.arrow(Col::Status)) {
                         sort_click = Some(Col::Status);
                     }
-                    if show[2] {
+                    if show[4] {
                         ui::head_cell(&mut h, "Остаток", true);
                     }
-                    if show[4] {
+                    if show[5] {
                         ui::head_cell(&mut h, "Примечание", false);
                     }
                     ui::head_cell(&mut h, "", true);
@@ -211,13 +231,22 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                         if show[3] {
                             ui::cell_text(&mut row, &l.dept, p.text2);
                         }
+                        if l.leave.kind.is_paid() {
+                            ui::cell_text(&mut row, l.leave.kind.short(), p.text2);
+                        } else {
+                            ui::cell_pill(&mut row, l.leave.kind.short(), kind_tone(l.leave.kind));
+                        }
                         ui::cell_text(&mut row, date::fmt_opt(l.leave.start), p.text2);
                         if show[0] {
                             ui::cell_text(&mut row, date::fmt_opt(l.end), p.text2);
                         }
-                        ui::cell_right(&mut row, if l.leave.base_days != 0.0 { engine::fmt_days(l.leave.base_days) } else { String::new() }, p.text);
+                        let len = l.leave.length();
+                        ui::cell_right(&mut row, if len > 0.0 { engine::fmt_days(len) } else { String::new() }, p.text);
                         if show[1] {
-                            ui::cell_right(&mut row, if l.leave.extra_days != 0.0 { engine::fmt_days(l.leave.extra_days) } else { String::new() }, p.text);
+                            ui::cell_right(&mut row, if l.leave.base_days != 0.0 { engine::fmt_days(l.leave.base_days) } else { String::new() }, p.text2);
+                        }
+                        if show[2] {
+                            ui::cell_right(&mut row, if l.leave.extra_days != 0.0 { engine::fmt_days(l.leave.extra_days) } else { String::new() }, p.text2);
                         }
                         match l.status {
                             Some(s) => {
@@ -227,10 +256,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                                 ui::cell_pill(&mut row, "нет дней", Tone::Danger);
                             }
                         }
-                        if show[2] {
+                        if show[4] {
                             ui::cell_right(&mut row, engine::fmt_days_opt(l.emp_left), ui::days_color(&p, l.emp_left));
                         }
-                        if show[4] {
+                        if show[5] {
                             ui::cell_text(&mut row, &l.leave.note, p.text3);
                         }
                         ui::cell(&mut row, |ui| {
@@ -269,18 +298,21 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
     }
     if cancel {
-        let emp = app.f.journal.draft.employee;
-        app.f.journal.draft = LeaveDraft::for_employee(emp);
+        let (emp, kind) = (app.f.journal.draft.employee, app.f.journal.draft.kind);
+        app.f.journal.draft = LeaveDraft { kind, ..LeaveDraft::for_employee(emp) };
     }
     if submit {
         if let Some(l) = app.f.journal.draft.to_leave() {
             let editing = app.f.journal.draft.is_edit();
             let emp = app.f.journal.draft.employee;
+            let kind = app.f.journal.draft.kind;
+            let moved = super::shift_note(&app.snap, &l);
             if app.save_leave(&l) {
                 let left = emp.and_then(|id| app.snap.emp_by_id(id)).and_then(|r| r.calc.left);
-                let tail = left.map(|v| format!(" · остаток {} дн.", engine::fmt_days(v))).unwrap_or_default();
+                let tail = if kind.is_paid() { left.map(|v| format!(" · остаток {} дн.", engine::fmt_days(v))).unwrap_or_default() } else { moved };
                 app.toast(true, format!("{}{tail}", if editing { "Запись изменена" } else { "Отпуск добавлен" }));
-                app.f.journal.draft = LeaveDraft::for_employee(emp);
+                // The kind stays chosen for quick consecutive entry, like the employee.
+                app.f.journal.draft = LeaveDraft { kind, ..LeaveDraft::for_employee(emp) };
             }
         }
     }

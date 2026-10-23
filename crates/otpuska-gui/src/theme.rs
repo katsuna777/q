@@ -2,7 +2,7 @@
 //! and five accent colors.
 
 use egui::{
-    Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Shadow, Stroke, TextStyle, Vec2,
+    Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Shadow, Stroke, TextStyle, Vec2,
 };
 use std::sync::Arc;
 
@@ -125,13 +125,18 @@ pub fn icons() -> FontFamily {
     FontFamily::Name("icons".into())
 }
 
+/// Once per window: the chooser and the working screen both ask for it.
 pub fn install_fonts(ctx: &Context) {
+    let done = Id::new("otpuska-fonts");
+    if ctx.data(|d| d.get_temp::<bool>(done)).unwrap_or(false) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(done, true));
     let mut fonts = FontDefinitions::default();
     let font = |bytes: &'static [u8]| Arc::new(FontData::from_static(bytes));
     fonts.font_data.insert("inter".into(), font(include_bytes!("../assets/fonts/Inter-Regular.ttf")));
     fonts.font_data.insert("inter-medium".into(), font(include_bytes!("../assets/fonts/Inter-Medium.ttf")));
     fonts.font_data.insert("inter-semibold".into(), font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")));
-    fonts.font_data.insert("jbmono".into(), font(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")));
 
     let fallbacks: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     // Icons live in their own family: Phosphor shares Private Use Area codepoints with
@@ -146,7 +151,6 @@ pub fn install_fonts(ctx: &Context) {
         list.extend(fallbacks.iter().cloned());
         fonts.families.insert(family, list);
     }
-    fonts.families.get_mut(&FontFamily::Monospace).expect("monospace").insert(0, "jbmono".into());
     ctx.set_fonts(fonts);
 }
 

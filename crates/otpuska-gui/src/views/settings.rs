@@ -1,7 +1,8 @@
-//! «Настройки»: five short tabs instead of one long page — calculation rules, departments,
-//! data (backups, Excel import), appearance and help.
+//! «Настройки»: six short tabs instead of one long page — calculation rules, departments,
+//! databases (one per organization), data (backups, Excel import), appearance and help.
 
 use crate::app::{page, top_bar, App};
+use crate::launcher::{describe, peek_entry};
 use crate::theme::ACCENTS;
 use crate::ui::{self, Kind, Tone};
 use egui::{vec2, Align, Layout, Sense, Stroke, Ui};
@@ -9,6 +10,7 @@ use egui_phosphor::regular as icon;
 use otpuska_core::config;
 use otpuska_core::date;
 use otpuska_core::engine::State as St;
+use otpuska_core::db::Peek;
 use otpuska_core::model::Settings;
 use std::collections::HashMap;
 
@@ -17,6 +19,7 @@ pub enum Tab {
     #[default]
     Calc,
     Depts,
+    Bases,
     Data,
     Look,
     Help,
@@ -29,11 +32,24 @@ pub struct State {
     pub sync: bool,
     pub new_dept: String,
     pub rename: HashMap<i64, String>,
+    pub new_db: String,
+    pub rename_db: HashMap<String, String>,
+    /// What each database holds, read when the tab is opened (and after changes), not every frame.
+    pub db_info: Option<HashMap<String, Result<Peek, String>>>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { tab: Tab::Calc, draft: Settings::default(), sync: true, new_dept: String::new(), rename: HashMap::new() }
+        State {
+            tab: Tab::Calc,
+            draft: Settings::default(),
+            sync: true,
+            new_dept: String::new(),
+            rename: HashMap::new(),
+            new_db: String::new(),
+            rename_db: HashMap::new(),
+            db_info: None,
+        }
     }
 }
 
@@ -109,12 +125,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui::segmented(
             ui,
             tab,
-            &[(Tab::Calc, "Расчёт"), (Tab::Depts, "Подразделения"), (Tab::Data, "Данные"), (Tab::Look, "Внешний вид"), (Tab::Help, "Справка")],
+            &[
+                (Tab::Calc, "Расчёт"),
+                (Tab::Depts, "Подразделения"),
+                (Tab::Bases, "Базы данных"),
+                (Tab::Data, "Данные"),
+                (Tab::Look, "Внешний вид"),
+                (Tab::Help, "Справка"),
+            ],
         );
         ui.add_space(4.0);
         match app.f.settings.tab {
             Tab::Calc => calc_tab(app, ui, dirty),
             Tab::Depts => depts_tab(app, ui, &snap),
+            Tab::Bases => bases_tab(app, ui),
             Tab::Data => {
                 data_tab(app, ui, &snap, &mut reveal, &mut do_import, &mut do_backup, &mut do_restore, &mut import_confirm, &mut import_cancel)
             }
@@ -219,6 +243,25 @@ fn calc_tab(app: &mut App, ui: &mut Ui, _dirty: bool) {
         }
     });
 
+    group_title(ui, "Напоминания");
+    ui::card(ui, |ui| {
+        row(ui, "О начале отпуска — срочно", "Карточка становится срочной. Работника уведомляют за 14 дней (ст. 123 ТК РФ)", |ui| {
+            int_field(ui, "set-remind-near", &mut d.remind_near_days, 120, "дн.");
+        });
+        ui::divider(ui);
+        row(ui, "О начале отпуска — заранее", "За сколько месяцев до начала отпуска показывать карточку", |ui| {
+            int_field(ui, "set-remind-far", &mut d.remind_far_months, 12, "мес.");
+        });
+        ui::divider(ui);
+        row(ui, "Окончание декретного отпуска и по уходу", "За сколько дней напомнить о выходе сотрудницы на работу", |ui| {
+            int_field(ui, "set-remind-end", &mut d.remind_end_days, 120, "дн.");
+        });
+        if d.remind_far_months > 0 && i64::from(d.remind_near_days) > i64::from(d.remind_far_months) * 31 {
+            ui.add_space(2.0);
+            ui::banner(ui, Tone::Warn, icon::WARNING, "Срочный срок длиннее месяца «заранее» — второй этап напоминаний не будет использоваться.");
+        }
+    });
+
     group_title(ui, "Приостановка трудового договора");
     ui::card(ui, |ui| {
         row(ui, "Засчитывать в стаж", "«Нет» — рабочие годы сдвигаются на срок приостановки (мобилизация, контракт)", |ui| {
@@ -308,6 +351,171 @@ fn depts_tab(app: &mut App, ui: &mut Ui, snap: &otpuska_core::Snapshot) {
     }
 }
 
+// ---- Базы данных -------------------------------------------------------------------------------
+
+/// Everything the tab asks for; carried out after drawing.
+#[derive(Default)]
+struct BaseActs {
+    rename: Option<(String, String)>,
+    open: Option<String>,
+    delete: Option<String>,
+    reveal: Option<std::path::PathBuf>,
+    create: bool,
+    add_file: bool,
+    ask: Option<bool>,
+}
+
+fn bases_tab(app: &mut App, ui: &mut Ui) {
+    let p = app.pal;
+    if app.f.settings.db_info.is_none() {
+        let info = app.config.databases.iter().map(|d| (d.id.clone(), peek_entry(&app.config, d))).collect();
+        app.f.settings.db_info = Some(info);
+    }
+    let mut act = BaseActs::default();
+    let current = app.current_db.clone();
+    let entries = app.config.databases.clone();
+
+    ui.add_space(10.0);
+    ui.label(ui::text(
+        "У каждой организации своя база: сотрудники, отпуска и настройки расчёта не смешиваются. Название меняется прямо в строке.",
+        12.5,
+        p.text2,
+    ));
+    ui.add_space(8.0);
+    ui::card(ui, |ui| {
+        if entries.is_empty() {
+            ui.label(ui::text("Баз пока нет.", 12.5, p.text3));
+        }
+        for (i, d) in entries.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(8.0);
+                ui::divider(ui);
+                ui.add_space(8.0);
+            }
+            let is_current = current.as_deref() == Some(d.id.as_str());
+            let file = app.config.db_file(d);
+            let info = app.f.settings.db_info.as_ref().and_then(|m| m.get(&d.id)).cloned().unwrap_or_else(|| Err(String::new()));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let buf = app.f.settings.rename_db.entry(d.id.clone()).or_insert_with(|| d.name.clone());
+                let w = (ui.available_width() - 330.0).max(160.0);
+                let r = ui::input(ui, buf, "", w);
+                let changed = buf.trim() != d.name;
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if changed && (enter || ui::button(ui, Kind::Secondary, Some(icon::CHECK), "", true).on_hover_text("Переименовать").clicked()) {
+                    act.rename = Some((d.id.clone(), buf.clone()));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let tip = if is_current { "Нельзя удалить открытую базу — сначала откройте другую" } else { "Удалить базу" };
+                    if ui::icon_button(ui, icon::TRASH, tip, !is_current).clicked() {
+                        act.delete = Some(d.id.clone());
+                    }
+                    if is_current {
+                        ui::pill(ui, "Открыта", Tone::Ok);
+                    } else if ui::button(ui, Kind::Secondary, Some(icon::ARROW_RIGHT), "Открыть", info.is_ok()).clicked() {
+                        act.open = Some(d.id.clone());
+                    }
+                    if ui::icon_button(ui, icon::FOLDER_OPEN, "Показать файл в папке", file.exists()).clicked() {
+                        act.reveal = Some(file.clone());
+                    }
+                });
+            });
+            // The open database is counted live; the others as they were when the tab was opened.
+            let stats = if is_current {
+                describe(&Ok(Peek { employees: app.snap.emps.len() as i64, leaves: app.snap.leaves.len() as i64, modified: None }))
+            } else {
+                describe(&info)
+            };
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(ui::text(format!("{stats}  ·  {}", ui::tildify(&file)), 11.5, if info.is_err() && !is_current { p.danger } else { p.text3 })).truncate());
+        }
+    });
+
+    ui.add_space(14.0);
+    ui::section_title(ui, "Новая база");
+    ui.add_space(6.0);
+    ui::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            let st = &mut app.f.settings;
+            let w = (ui.available_width() - 150.0).max(160.0);
+            let r = ui::input(ui, &mut st.new_db, "Название организации", w);
+            let can = !st.new_db.trim().is_empty();
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = ui::button(ui, Kind::Primary, Some(icon::PLUS), "Создать", can).clicked();
+            if can && (clicked || enter) {
+                act.create = true;
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui::link(ui, Some(icon::FOLDER_OPEN), "Добавить из файла…").clicked() {
+                act.add_file = true;
+            }
+            ui.label(ui::text("файл .db: резервная копия или база с другого компьютера", 11.5, p.text3));
+        });
+    });
+
+    ui.add_space(14.0);
+    ui::card(ui, |ui| {
+        row(ui, "Спрашивать при запуске", "Выключено — сразу открывается база, с которой работали в прошлый раз", |ui| {
+            let mut ask = app.config.ask_on_start();
+            if ui::toggle(ui, &mut ask).changed() {
+                act.ask = Some(ask);
+            }
+        });
+    });
+    ui.add_space(6.0);
+    ui.label(ui::text("Если в списке одна база, она открывается сразу. Сменить базу можно и плашкой с названием в левом верхнем углу.", 11.5, p.text3));
+
+    // ---- carry out
+    let mut refresh = false;
+    if let Some((id, name)) = act.rename {
+        if app.rename_database(&id, &name) {
+            app.f.settings.rename_db.remove(&id);
+        }
+    }
+    if let Some(path) = act.reveal {
+        app.reveal(&path);
+    }
+    if act.create {
+        let name = app.f.settings.new_db.clone();
+        if app.create_database(&name) {
+            app.f.settings.new_db.clear();
+            refresh = true;
+        }
+    }
+    if act.add_file {
+        let name = app.f.settings.new_db.clone();
+        if app.add_database_from_file(&name) {
+            app.f.settings.new_db.clear();
+            refresh = true;
+        }
+    }
+    if let Some(ask) = act.ask {
+        app.set_ask_on_start(ask);
+    }
+    if let Some(id) = act.delete {
+        let key = format!("delete-db-{id}");
+        if app.armed(ui, &key) {
+            app.confirm(ui, &key);
+            if app.delete_database(&id) {
+                app.f.settings.rename_db.remove(&id);
+                refresh = true;
+            }
+        } else {
+            app.confirm(ui, &key);
+            let name = app.config.find_db(&id).map(|d| d.name.clone()).unwrap_or_default();
+            app.toast(true, format!("Нажмите на корзину ещё раз, чтобы удалить базу «{name}»"));
+        }
+    }
+    if refresh {
+        app.f.settings.db_info = None;
+    }
+    if let Some(id) = act.open {
+        app.switch_database(&id);
+    }
+}
+
 // ---- Данные ------------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -325,6 +533,10 @@ fn data_tab(
     let p = app.pal;
     let path = app.db.path().to_path_buf();
 
+    if let Some(name) = app.db_name() {
+        ui.add_space(10.0);
+        ui.label(ui::text(format!("Всё на этой вкладке относится к базе «{name}»."), 12.5, p.text2));
+    }
     group_title(ui, "Где хранятся данные");
     ui::card(ui, |ui| {
         row(ui, "Файл базы", &ui::tildify(&path), |ui| {
@@ -374,7 +586,12 @@ fn data_tab(
             ui.add_space(6.0);
             ui.label(ui::text(format!("В файле: {}.", pv.import.summary()), 13.0, p.text));
             ui.label(ui::text(
-                format!("Сейчас в базе: {} сотрудников, {} записей журнала — они будут заменены. Перед заменой программа сохранит копию.", snap.emps.len(), snap.leaves.len()),
+                format!(
+                    "Сейчас в базе{}: {} сотрудников, {} записей журнала — они будут заменены. Перед заменой программа сохранит копию.",
+                    app.db_name().map(|n| format!(" «{n}»")).unwrap_or_default(),
+                    snap.emps.len(),
+                    snap.leaves.len()
+                ),
                 12.5,
                 p.text2,
             ));
@@ -468,17 +685,42 @@ fn help_tab(app: &mut App, ui: &mut Ui) {
         ui::divider(ui);
         ui::accordion(ui, "help-start", icon::LIST_CHECKS, "С чего начать", false, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
-            text(ui, "1. «Настройки» → «Подразделения»: добавьте подразделения (или загрузите старую книгу Excel на вкладке «Данные»).");
+            text(ui, "1. «Настройки» → «Подразделения»: добавьте подразделения (или загрузите старую книгу Excel на вкладке «Данные»). Если организаций несколько — у каждой своя база, см. ниже.");
             text(ui, "2. «Сотрудники» → «Новый сотрудник»: ФИО, подразделение, дата приема. Дальше всё считается само.");
             text(ui, "3. «Журнал отпусков»: выберите сотрудника, дату начала и число дней — «Добавить». «14+14» — это две записи.");
-            text(ui, "4. «Сводка» покажет, у кого отпуск просрочен, «горит» или скоро. Клик по строке открывает карточку.");
+            text(ui, "4. «График отпусков»: запланируйте отпуска на год — за две недели и за месяц до начала программа напомнит.");
+            text(ui, "5. «Сводка» покажет, у кого отпуск просрочен, «горит» или скоро. Клик по строке открывает карточку.");
+        });
+        ui::divider(ui);
+        ui::accordion(ui, "help-bases", icon::DATABASE, "Несколько баз: разные организации", false, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            text(ui, "У каждой организации своя база: сотрудники, журнал, подразделения и настройки расчёта не смешиваются. Какая база открыта сейчас — написано в левом верхнем углу.");
+            text(ui, "Сменить базу или создать новую — нажмите на эту плашку (или «Настройки» → «Базы данных»). При запуске программа спрашивает, в какую базу войти; это можно выключить — тогда откроется последняя.");
+            text(ui, "Переименовать и удалить базу — «Настройки» → «Базы данных». Удалённая база ещё 30 дней лежит в папке «deleted» рядом с данными, потом стирается. Резервные копии, загрузка из Excel и восстановление всегда работают с открытой базой.");
         });
         ui::divider(ui);
         ui::accordion(ui, "help-calc", icon::CALCULATOR, "Как считается остаток", false, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             text(ui, "Рабочий год считается от даты приема и длится 12 месяцев. За каждый год положено 28 дней основного отпуска плюс дополнительный (за вредность), если он задан в карточке.");
             text(ui, "Отгулянные дни списываются с самого раннего периода — отдельно основной и дополнительный. Отпуск с датой начала в будущем считается использованным (запланированным).");
-            text(ui, "Крайний срок для периода — конец рабочего года плюс срок использования (по умолчанию 12 месяцев). После него отпуск «просрочен».");
+            text(ui, "Крайний срок для периода — конец рабочего года плюс срок использования (по умолчанию 12 месяцев). После него отпуск «просрочен». Если рабочий год продлён отпуском без оплаты или по уходу за ребёнком, срок сдвигается вместе с ним.");
+        });
+        ui::divider(ui);
+        ui::accordion(ui, "help-kinds", icon::BABY, "Отпуск без оплаты, декретный, по уходу за ребёнком", false, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            text(ui, "В «Журнале отпусков» выберите вид отпуска. Ежегодный списывается с остатка. Остальные виды вносятся датами «с — по» и остаток не меняют, зато влияют на рабочий год.");
+            text(ui, "Без сохранения оплаты: в рабочем году в стаж идут первые 14 календарных дней. Всё, что сверх, не засчитывается — окончание рабочего года переносится на столько же дней, а следующий год считается со дня после него (ст. 121, 128 ТК РФ). Крайние сроки отпусков сдвигаются вместе с годом.");
+            text(ui, "По уходу за ребёнком: не идёт в стаж (ст. 121 ТК РФ), поэтому рабочий год продлевается на весь срок отпуска. Для окончания можно указать дату рождения ребёнка — кнопки «1,5 лет» и «3 лет» подставят дату.");
+            text(ui, "По беременности и родам: идёт в стаж, рабочие годы не сдвигаются. Кнопки 140 / 156 / 194 дн. подставляют обычную продолжительность (ст. 255 ТК РФ).");
+            text(ui, "Продлённые годы отмечены на вкладке «Периоды» жёлтыми датами и в карточке сотрудника значком «+N дн.».");
+        });
+        ui::divider(ui);
+        ui::accordion(ui, "help-schedule", icon::CALENDAR_DOTS, "График отпусков и напоминания", false, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            text(ui, "«График отпусков» — план на год: сотрудник, дата начала, число дней. Программа сверяет его с журналом: «По графику» — отпуск впереди; «Оформлен» — запись в журнале есть; «В отпуске» и «Использован»; «Не оформлен» — дата наступила, а в журнале отпуска нет.");
+            text(ui, "Запись графика выполняет запись журнала того же сотрудника с пересекающимися датами. Если отпуск перенесли, измените дату в графике — иначе он останется «Не оформлен». Кнопка с книгой вносит отпуск из графика в журнал.");
+            text(ui, "«Напоминания»: за 14 дней и за 1 месяц до начала отпуска (по журналу и по графику), а также за 14 дней до окончания отпуска по беременности и родам и по уходу за ребёнком. Переключатель сверху оставляет нужный срок. Сроки меняются в «Настройках» → «Расчёт». Число напоминаний видно у вкладки в боковой панели и на «Сводке».");
+            text(ui, "Работника нужно письменно уведомить о начале отпуска под роспись не позднее чем за 2 недели (ст. 123 ТК РФ) — на карточке напоминания указана эта дата.");
         });
         ui::divider(ui);
         ui::accordion(ui, "help-staff", icon::USER_MINUS, "Увольнение, приостановка, вредность", false, |ui| {
@@ -497,7 +739,7 @@ fn help_tab(app: &mut App, ui: &mut Ui) {
         ui::accordion(ui, "help-keys", icon::KEYBOARD, "Горячие клавиши", false, |ui| {
             let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
             ui.spacing_mut().item_spacing.y = 6.0;
-            text(ui, &format!("{cmd} + 1…6 — вкладки: Сводка, Сотрудники, Периоды, Журнал, Отчёты, Настройки."));
+            text(ui, &format!("{cmd} + 1…6 — вкладки: Сводка, Сотрудники, Периоды, Журнал, Отчёты, Настройки; {cmd} + 7 — График, {cmd} + 8 — Напоминания."));
             text(ui, &format!("{cmd} + N — новый сотрудник."));
         });
         ui::divider(ui);

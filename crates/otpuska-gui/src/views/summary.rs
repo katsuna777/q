@@ -147,8 +147,32 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     let mut open = None;
     let mut to_reports = false;
+    let (mut to_reminders, mut dismiss_notice) = (false, false);
     let mut rows: Vec<usize> = Vec::new();
     fixed_page(ui, 1280.0, |ui| {
+        if let Some(text) = &app.upgrade_notice {
+            ui::banner(ui, Tone::Info, icon::INFO, text);
+            dismiss_notice = ui::link(ui, None, "Понятно").clicked();
+            ui.add_space(6.0);
+        }
+        let (urgent, early) = (snap.reminders_urgent(), snap.reminders_early());
+        if urgent + early > 0 {
+            let missed = snap.reminders.iter().filter(|r| r.band == otpuska_core::schedule::Band::Missed).count();
+            let mut parts = Vec::new();
+            if missed > 0 {
+                parts.push(format!("не оформлено по графику: {missed}"));
+            }
+            let near = urgent - missed;
+            if near > 0 {
+                parts.push(format!("в ближайшие {} дн.: {near}", snap.params.remind_near_days));
+            }
+            if early > 0 {
+                parts.push(format!("в течение {} мес.: {early}", snap.params.remind_far_months));
+            }
+            ui::banner(ui, if urgent > 0 { Tone::Warn } else { Tone::Info }, icon::BELL, &format!("Напоминания об отпусках — {}.", parts.join(", ")));
+            to_reminders = ui::link(ui, Some(icon::ARROW_RIGHT), "Открыть напоминания").clicked();
+            ui.add_space(6.0);
+        }
         for w in snap.warnings() {
             let (tone, glyph) = match w.severity {
                 engine::Severity::Warn => (Tone::Warn, icon::WARNING),
@@ -268,6 +292,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     }
     if to_reports {
         app.go(Route::Reports);
+    }
+    if to_reminders {
+        app.go(Route::Reminders);
+    }
+    if dismiss_notice {
+        app.upgrade_notice = None;
     }
     if let Some(id) = open {
         app.open_employee(id);

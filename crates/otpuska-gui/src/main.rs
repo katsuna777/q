@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod launcher;
 mod platform;
 #[cfg(test)]
 mod screenshots;
@@ -11,12 +12,25 @@ mod theme;
 mod ui;
 mod views;
 
-use otpuska_core::config::{self, Config};
-use otpuska_core::{date, Db};
+use otpuska_core::config::Config;
 use std::sync::Arc;
 
+/// When the process started: `OTPUSKA_TIMING=1` prints how long the start takes (for diagnosing slow machines).
+pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn timing_enabled() -> bool {
+    std::env::var_os("OTPUSKA_TIMING").is_some_and(|v| !v.is_empty())
+}
+
 fn main() -> eframe::Result {
-    let config = Config::load();
+    STARTED.get_or_init(std::time::Instant::now);
+    let mut config = Config::load();
+    // First start of a newer version: the database of the older one joins the list, in place.
+    if config.migrate() {
+        if let Err(e) = config.save() {
+            eprintln!("otpuska: не удалось сохранить настройки: {e:#}");
+        }
+    }
     // First the default graphics backend (Metal / DirectX 12); if the window cannot be created
     // (old driver, remote desktop), once more through OpenGL before giving up.
     if let Err(first) = run(&config) {
@@ -32,24 +46,12 @@ fn main() -> eframe::Result {
 }
 
 fn run(config: &Config) -> eframe::Result {
-    let db_path = config.db_path();
-    let db = match Db::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            fatal(&format!("Не удалось открыть базу данных\n{}\n\n{e:#}", db_path.display()));
-            return Ok(());
-        }
-    };
-    // One backup per day, the last two weeks are kept.
-    if let Err(e) = config::auto_backup(&db, date::today(), 14) {
-        eprintln!("otpuska: автокопия не создана: {e:#}");
-    }
-
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Отпуска")
         .with_app_id("dev.otpuska.desktop")
-        .with_inner_size([1360.0, 860.0])
-        .with_min_inner_size([1180.0, 640.0]);
+        .with_inner_size(launcher::WINDOW_SIZE)
+        // The real smallest size is set once the screen is known (`launcher::Root::fit_window`).
+        .with_min_inner_size([900.0, 540.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(Arc::new(icon));
     }
@@ -70,10 +72,8 @@ fn run(config: &Config) -> eframe::Result {
     eframe::run_native(
         "Отпуска",
         options,
-        Box::new(move |cc| match app::App::new(&cc.egui_ctx, db, config) {
-            Ok(app) => Ok(Box::new(app)),
-            Err(e) => Err(format!("{e:#}").into()),
-        }),
+        // The database is opened inside: straight away when there is one, after a choice otherwise.
+        Box::new(move |cc| Ok(Box::new(launcher::Root::new(&cc.egui_ctx, config)))),
     )
 }
 

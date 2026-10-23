@@ -24,6 +24,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 egui_extras = "0.36"
 
 [dev-dependencies]
+otpuska-core = { workspace = true, features = ["test-support"] }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 tempfile = "3"
 

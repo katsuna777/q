@@ -1,16 +1,17 @@
 #!/bin/sh
 # Wrap dist/Otpuska.app into a disk image: dist/Otpuska-<version>-macos.dmg
-# (run packaging/macos/bundle.sh first).
+# (run packaging/macos/bundle.sh first; DIST_DIR must be the same for both).
 set -eu
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-stage="dist/dmg"
+dist="${DIST_DIR:-dist}"
+stage="$dist/dmg"
 rm -rf "$stage"
 mkdir -p "$stage"
-cp -R dist/Otpuska.app "$stage/"
+cp -R "$dist/Otpuska.app" "$stage/"
 ln -s /Applications "$stage/Applications"
-out="dist/Otpuska-$version-macos.dmg"
+out="$dist/Otpuska-$version-macos.dmg"
 rm -f "$out"
 hdiutil create -volname "Отпуска $version" -srcfolder "$stage" -ov -format UDZO "$out" >/dev/null
 rm -rf "$stage"

@@ -76,6 +76,8 @@ pub fn show(app: &mut App, ui: &mut Ui, target: &Target) {
         Route::Summary => "Сводка",
         Route::Periods => "Периоды",
         Route::Journal => "Журнал",
+        Route::Schedule => "График",
+        Route::Reminders => "Напоминания",
         Route::Reports => "Отчёты",
         _ => "Сотрудники",
     };
@@ -351,19 +353,39 @@ fn totals(app: &mut App, ui: &mut Ui, snap: &Snapshot, r: &engine::EmpRow) {
     }
 }
 
+/// Why a working year is longer than twelve months, for the hover text.
+pub fn shift_text(pr: &PeriodRow) -> String {
+    if pr.shift == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if pr.unpaid > 0 {
+        parts.push(format!("отпуск без оплаты {} дн., из них в стаж идут 14", pr.unpaid));
+    }
+    if pr.childcare > 0 {
+        parts.push(format!("отпуск по уходу за ребёнком {} дн. (в стаж не идёт)", pr.childcare));
+    }
+    format!("\nРабочий год продлён на {} дн.: {}", pr.shift, parts.join("; "))
+}
+
 fn period_line(ui: &mut Ui, p: &crate::theme::Pal, pr: &PeriodRow) {
     let tone = ui::period_tone(pr.tone);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), egui::Sense::hover());
     let painter = ui.painter();
     let mid = rect.center().y;
     painter.text(rect.left_center() + vec2(0.0, 0.0), egui::Align2::LEFT_CENTER, format!("{}", pr.k), egui::FontId::new(11.5, egui::FontFamily::Proportional), p.text3);
-    painter.text(
-        rect.left_center() + vec2(22.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        format!("{} – {}", date::fmt(pr.start), date::fmt(pr.end)),
-        egui::FontId::new(12.5, crate::theme::medium()),
-        p.text,
-    );
+    let dates = painter.layout_no_wrap(format!("{} – {}", date::fmt(pr.start), date::fmt(pr.end)), egui::FontId::new(12.5, crate::theme::medium()), p.text);
+    let dates_w = dates.size().x;
+    painter.galley(egui::pos2(rect.left() + 22.0, mid - dates.size().y / 2.0), dates, p.text);
+    if pr.shift > 0 {
+        painter.text(
+            egui::pos2(rect.left() + 22.0 + dates_w + 8.0, mid),
+            egui::Align2::LEFT_CENTER,
+            format!("+{} дн.", pr.shift),
+            egui::FontId::new(11.5, crate::theme::medium()),
+            p.warn,
+        );
+    }
     // Right side: remaining + status pill drawn by hand to stay on one line.
     let (label, left_txt) = match (pr.available, pr.left) {
         (false, _) => ("ещё не положено".to_string(), String::new()),
@@ -390,12 +412,13 @@ fn period_line(ui: &mut Ui, p: &crate::theme::Pal, pr: &PeriodRow) {
     }
     painter.hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, p.border));
     resp.on_hover_text(format!(
-        "Положено {} · отгуляно {} · остаток {}{}\nКрайний срок {}",
+        "Положено {} · отгуляно {} · остаток {}{}\nКрайний срок {}{}",
         engine::fmt_days(pr.entitled),
         engine::fmt_days_opt(pr.taken),
         engine::fmt_days_opt(pr.left),
         pr.left_extra.map(|e| format!(" (в т.ч. доп. {})", engine::fmt_days(e))).unwrap_or_default(),
-        date::fmt(pr.deadline)
+        date::fmt(pr.deadline),
+        shift_text(pr),
     ));
 }
 
@@ -438,12 +461,16 @@ fn leaves(app: &mut App, ui: &mut Ui, snap: &Snapshot, id: i64) {
                 _ => "без даты".to_string(),
             };
             child.add_sized([190.0, 20.0], egui::Label::new(ui::strong(period, 13.0, p.text)));
-            let days = match (l.leave.base_days > 0.0, l.leave.extra_days > 0.0) {
-                (true, true) => format!("{} + {} доп.", engine::fmt_days(l.leave.base_days), engine::fmt_days(l.leave.extra_days)),
-                (false, true) => format!("{} доп.", engine::fmt_days(l.leave.extra_days)),
+            let days = match (l.leave.kind.is_paid(), l.leave.base_days > 0.0, l.leave.extra_days > 0.0) {
+                (false, _, _) => format!("{} дн.", engine::fmt_days(l.leave.length())),
+                (_, true, true) => format!("{} + {} доп.", engine::fmt_days(l.leave.base_days), engine::fmt_days(l.leave.extra_days)),
+                (_, false, true) => format!("{} доп.", engine::fmt_days(l.leave.extra_days)),
                 _ => format!("{} дн.", engine::fmt_days(l.leave.base_days)),
             };
             child.add_sized([110.0, 20.0], egui::Label::new(ui::text(days, 13.0, p.text2)));
+            if !l.leave.kind.is_paid() {
+                ui::pill(&mut child, l.leave.kind.short(), super::journal::kind_tone(l.leave.kind));
+            }
             if let Some(s) = l.status {
                 ui::pill(&mut child, s.label(), match s {
                     LeaveStatus::InLeave => Tone::Ok,
@@ -485,9 +512,11 @@ fn leaves(app: &mut App, ui: &mut Ui, snap: &Snapshot, id: i64) {
     if submit {
         if let Some(l) = app.f.employee.leave.to_leave() {
             let editing = app.f.employee.leave.is_edit();
+            let kind = app.f.employee.leave.kind;
+            let moved = super::shift_note(&app.snap, &l);
             if app.save_leave(&l) {
-                app.toast(true, if editing { "Запись изменена" } else { "Отпуск добавлен" });
-                app.f.employee.leave = LeaveDraft::for_employee(Some(id));
+                app.toast(true, format!("{}{moved}", if editing { "Запись изменена" } else { "Отпуск добавлен" }));
+                app.f.employee.leave = LeaveDraft { kind, ..LeaveDraft::for_employee(Some(id)) };
             }
         }
     }
